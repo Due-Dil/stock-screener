@@ -15,11 +15,16 @@ def get_stock_info(ticker: str) -> dict:
     }
 
 
-def screen_stocks(tickers: list[str]) -> list[dict]:
+def screen_stocks(tickers: list[str], max_pe: float | None = None) -> list[dict]:
     results = []
     for ticker in tickers:
         try:
-            results.append(get_stock_info(ticker))
+            info = get_stock_info(ticker)
+            if max_pe is not None:
+                pe = info.get("pe_ratio")
+                if pe == "N/A" or (isinstance(pe, float) and pe > max_pe):
+                    continue
+            results.append(info)
         except Exception as e:
             print(f"Error fetching {ticker}: {e}")
     return results
@@ -27,6 +32,6 @@ def screen_stocks(tickers: list[str]) -> list[dict]:
 
 if __name__ == "__main__":
     tickers = ["AAPL", "MSFT", "GOOGL", "AMZN"]
-    stocks = screen_stocks(tickers)
+    stocks = screen_stocks(tickers, max_pe=30)
     for s in stocks:
         print(f"{s['ticker']} | {s['name']} | Price: {s['price']} | P/E: {s['pe_ratio']}")
