@@ -1,0 +1,11 @@
+# Generated screener output
+results.html
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
