@@ -218,7 +218,7 @@ HTML = """<!DOCTYPE html>
   <div id="chart-panel">
     <div id="chart-inner">
       <div id="chart-title">
-        <div><strong id="chart-ticker-label"></strong><span id="chart-name"></span></div>
+        <div><strong id="chart-ticker-label"></strong><span id="chart-name"></span><span id="chart-earnings" style="color:#a878ff; font-size:0.78rem; margin-left:10px;"></span></div>
         <button id="close-chart" onclick="closeChart()">✕</button>
       </div>
       <div id="plotly-chart"></div>
@@ -327,12 +327,17 @@ async function loadChart(ticker, name) {
   panel.classList.add('open');
   document.getElementById('chart-ticker-label').textContent = ticker;
   document.getElementById('chart-name').textContent = name ? ' — ' + name : '';
+  document.getElementById('chart-earnings').textContent = '';
   document.getElementById('plotly-chart').innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#555"><span class="spinner"></span> Loading…</div>';
 
   const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}`);
   const data = await res.json();
   Plotly.newPlot('plotly-chart', data.traces, data.layout, { responsive: true, displayModeBar: false });
+
+  const earn = data.earnings || [];
+  document.getElementById('chart-earnings').textContent =
+    earn.length ? '◦ Earnings (±30j): ' + earn.join(', ') : '◦ Aucun earnings dans ±30j';
 }
 
 function closeChart() {
@@ -455,21 +460,54 @@ def chart(ticker: str):
          "line": {"color": "#e05c5c", "width": 1.5, "dash": "dash"}},
     ]
 
+    # Crossover markers (green)
     shapes = [{"type": "line", "x0": d, "x1": d, "y0": 0, "y1": 1, "xref": "x", "yref": "paper",
                "line": {"color": "rgba(80,200,120,0.7)", "width": 2}} for d in cross_dates]
     annotations = [{"x": d, "y": 1, "xref": "x", "yref": "paper", "text": "Cross",
                     "showarrow": False, "font": {"color": "rgba(80,200,120,1)", "size": 10},
                     "yanchor": "bottom"} for d in cross_dates]
 
+    # Earnings markers (violet) within ±30 days of today
+    earnings_dates = _get_earnings_window(ticker, days=30)
+    for d in earnings_dates:
+        shapes.append({"type": "line", "x0": d, "x1": d, "y0": 0, "y1": 1, "xref": "x", "yref": "paper",
+                       "line": {"color": "rgba(168,120,255,0.8)", "width": 2, "dash": "dot"}})
+        annotations.append({"x": d, "y": 0, "xref": "x", "yref": "paper", "text": "E",
+                            "showarrow": False, "font": {"color": "rgba(168,120,255,1)", "size": 10},
+                            "yanchor": "bottom"})
+
+    # If an upcoming earnings sits beyond the last price point, extend the x-axis to keep it visible
+    xaxis = {"gridcolor": "#2a2a4a"}
+    if earnings_dates:
+        last_date = dates[-1] if dates else None
+        max_earn = max(earnings_dates)
+        if last_date and max_earn > last_date:
+            xaxis["range"] = [dates[0], max_earn]
+
     layout = {
         "height": 300, "margin": {"l": 50, "r": 20, "t": 10, "b": 40},
         "plot_bgcolor": "#1a1a2e", "paper_bgcolor": "#13132a", "font": {"color": "#eaeaea"},
-        "xaxis": {"gridcolor": "#2a2a4a"}, "yaxis": {"gridcolor": "#2a2a4a"},
+        "xaxis": xaxis, "yaxis": {"gridcolor": "#2a2a4a"},
         "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
         "shapes": shapes, "annotations": annotations,
     }
 
-    return jsonify({"traces": traces, "layout": layout})
+    return jsonify({"traces": traces, "layout": layout, "earnings": earnings_dates})
+
+
+def _get_earnings_window(ticker: str, days: int = 30) -> list[str]:
+    """Return earnings dates (as YYYY-MM-DD strings) within +/- `days` of today."""
+    try:
+        ed = yf.Ticker(ticker).get_earnings_dates(limit=24)
+        if ed is None or ed.empty:
+            return []
+        today = pd.Timestamp.now(tz=ed.index.tz)
+        lo = today - pd.Timedelta(days=days)
+        hi = today + pd.Timedelta(days=days)
+        in_window = [ts for ts in ed.index if lo <= ts <= hi]
+        return sorted({ts.date().isoformat() for ts in in_window})
+    except Exception:
+        return []
 
 
 if __name__ == "__main__":

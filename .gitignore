@@ -9,3 +9,6 @@ venv/
 
 # OS / editor
 .DS_Store
+
+# Personal/machine-specific Claude Code settings
+.claude/settings.local.json
