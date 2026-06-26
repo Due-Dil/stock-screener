@@ -12,10 +12,10 @@ from . import data as D
 from . import model as M
 
 
-# Sharpening factor fit on a 16-week backtest (corrects residual under-confidence). Dropped from
-# 1.85 -> 1.45 after retuning the level estimator (shorter window) fixed most of the over-dispersion
-# at its root. The app can re-fit it from the backtest panel; 1.0 = raw model probabilities.
-CALIBRATED_GAMMA = 1.45
+# Sharpening factor fit on a 16-week backtest (corrects residual under-confidence). Walked down
+# 1.85 -> 1.45 (shorter level window) -> 1.20 (within-window pace conditioning) as each change fixed
+# more over-dispersion at its source. The app can re-fit it from the backtest panel; 1.0 = raw.
+CALIBRATED_GAMMA = 1.20
 
 
 @dataclass

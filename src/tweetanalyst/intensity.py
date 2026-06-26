@@ -52,6 +52,25 @@ class IntensityModel:
         base = self.weekly_totals[idx].astype(float)
         return np.maximum(0.0, rng.gamma(shape=np.maximum(base, 1.0), scale=1.0))
 
+    def sample_level_conditional(
+        self, rng: np.random.Generator, n: int,
+        n_obs: int, elapsed_mass: float, prior_strength: float = 1.0,
+    ) -> np.ndarray:
+        """Weekly level **updated by the within-window pace so far** (Gamma-Poisson conjugate).
+
+        Prior = recent-weeks mean ``mean_level`` worth ``prior_strength`` weeks of pseudo-data.
+        Likelihood: ``n_obs`` counts observed over ``elapsed_mass`` (fraction of the week's seasonal
+        mass already elapsed). Posterior weekly level ~ Gamma(mean_level*b + n_obs, b + elapsed_mass).
+        Early in the week (small elapsed_mass) it stays near the prior; later it follows the realized
+        pace. ``prior_strength`` is the crossover: at elapsed_mass == prior_strength the two weigh equally.
+        """
+        e = float(elapsed_mass)
+        if e <= 1e-6 or self.mean_level <= 0:
+            return self.sample_level(rng, n)
+        b = float(prior_strength)
+        a = self.mean_level * b
+        return rng.gamma(a + n_obs, 1.0 / (b + e), size=n)
+
 
 def _recency_weights(ages_days: np.ndarray, half_life_days: float) -> np.ndarray:
     w = np.exp(-np.log(2.0) * ages_days / half_life_days)

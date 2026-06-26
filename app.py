@@ -56,9 +56,11 @@ def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
     run = P.run_forecast(slug, handle=handle, now=now, n_sims=n_sims, gamma=gamma)
     conf = M.confidence_report(run.table, run.forecast.samples,
                                run.forecast.summary()["hours_remaining"])
+    daily = M.daily_forecast(run.fit, run.window_start, run.window_end)
     # repackage to a cacheable dict (avoid caching heavy objects with live handles)
     return {
         "confidence": conf,
+        "daily": daily,
         "title": run.market.title,
         "window_start": run.window_start,
         "window_end": run.window_end,
@@ -260,6 +262,38 @@ with col_r:
                        xaxis_title="tranche", yaxis_title="probabilité",
                        legend=dict(orientation="h", y=1.1))
     st.plotly_chart(fig2, use_container_width=True)
+
+# ---- Per-day forecast: actuals + estimated, over the selected market window ----
+st.markdown("#### Prévision du nombre de tweets par jour (réels + estimés)")
+dd = R["daily"]
+labels = [f"{DAYS[d['date'].weekday()]} {d['date'].day}" for d in dd]
+actual = [d["actual"] for d in dd]
+est_rem = [max(d["est_median"] - d["actual"], 0) if d["status"] != "passé" else 0 for d in dd]
+fut_mask = [d["status"] != "passé" for d in dd]
+fut_x = [labels[i] for i, m in enumerate(fut_mask) if m]
+fut_med = [dd[i]["est_median"] for i, m in enumerate(fut_mask) if m]
+err_up = [dd[i]["est_p90"] - dd[i]["est_median"] for i, m in enumerate(fut_mask) if m]
+err_dn = [dd[i]["est_median"] - dd[i]["est_p10"] for i, m in enumerate(fut_mask) if m]
+
+figd = go.Figure()
+figd.add_bar(x=labels, y=actual, name="Réels (déjà postés)", marker_color="#1f77b4")
+figd.add_bar(x=labels, y=est_rem, name="Estimés (à venir)", marker_color="#E8B04C")
+if fut_x:
+    figd.add_scatter(
+        x=fut_x, y=fut_med, mode="markers", marker=dict(opacity=0),
+        error_y=dict(type="data", symmetric=False, array=err_up, arrayminus=err_dn,
+                     color="rgba(80,80,80,0.7)", thickness=1.5, width=5),
+        name="plage 10–90 %", showlegend=True,
+    )
+figd.update_layout(height=340, barmode="stack", margin=dict(l=10, r=10, t=10, b=10),
+                   xaxis_title="jour (ET)", yaxis_title="tweets / jour",
+                   legend=dict(orientation="h", y=1.12))
+st.plotly_chart(figd, use_container_width=True)
+st.caption(
+    "Bleu = tweets déjà postés (exacts). Orange = estimation médiane du reste de la journée / des "
+    "jours à venir, avec la barre d'incertitude 10–90 %. Le dernier jour est souvent une demi-journée "
+    "(le marché clôture le vendredi midi ET)."
+)
 
 st.markdown("#### Rythme de tweets — intensité par jour × heure (heure ET, pondérée récence)")
 hm = R["heatmap"]  # (7, 24) tweets/hour

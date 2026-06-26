@@ -90,6 +90,7 @@ def forecast(
     window_end: dt.datetime,
     n_sims: int = 20000,
     rng: np.random.Generator | None = None,
+    level_prior_strength: float | None = 1.0,  # best on 16-week backtest (logloss 1.95->1.89)
 ) -> Forecast:
     rng = rng or np.random.default_rng(12345)
     now = fit.now
@@ -134,7 +135,18 @@ def forecast(
     ages_h = (eff_now - seed_evs).dt.total_seconds().values / 3600.0
     Z0 = H.seed_decay_sum(ages_h, beta)
 
-    levels = fit.intensity.sample_level(rng, n_sims)
+    # Level conditioned on the within-window pace so far (fraction of weekly seasonal mass elapsed).
+    # level_prior_strength=None disables conditioning (old prior-only behavior, for A/B testing).
+    if level_prior_strength is None:
+        levels = fit.intensity.sample_level(rng, n_sims)
+    else:
+        elapsed_mass = float(
+            sum(fit.intensity.shape[W.et_cell_of_offset(window_start, k)]
+                for k in range(int(round(now_offset))))
+        )
+        levels = fit.intensity.sample_level_conditional(
+            rng, n_sims, n_obs, elapsed_mass, prior_strength=level_prior_strength
+        )
     remaining = H.simulate_remaining(
         rng, g_window, T_remaining, levels, fit.hawkes.alpha, beta, np.full(n_sims, Z0)
     )
@@ -143,6 +155,90 @@ def forecast(
         n_obs=n_obs, hours_elapsed=hours_elapsed, hours_remaining=T_remaining,
         window_start=window_start, window_end=window_end,
     )
+
+
+def daily_forecast(
+    fit: ModelFit,
+    window_start: dt.datetime,
+    window_end: dt.datetime,
+    n_sims: int = 4000,
+    rng: np.random.Generator | None = None,
+) -> list[dict]:
+    """Per-ET-day tweet counts over the market window: actuals for elapsed days, simulated bands
+    (median, p10, p90) for the current partial day and future days.
+
+    Returns one dict per ET calendar day with: date, actual (tweets so far that day),
+    est_median/est_p10/est_p90 (that day's total), and status in {passé, partiel, futur}.
+    """
+    rng = rng or np.random.default_rng(7)
+    posts = fit.posts
+    ws, we = W.utc_ts(window_start), W.utc_ts(window_end)
+    eff_now = max(W.utc_ts(fit.now), ws)
+    T_remaining = (we - eff_now).total_seconds() / 3600.0
+
+    et_dates = pd.date_range(
+        ws.tz_convert(W.ET).normalize(), we.tz_convert(W.ET).normalize(), freq="D"
+    ).date
+
+    # --- simulate remaining, bucketed by ET day ---
+    sim_by_date: dict = {}
+    if T_remaining > 0:
+        edges, date_seq, cur, cur_date = [], [], eff_now, eff_now.tz_convert(W.ET).date()
+        while cur < we:
+            nxt_mid = pd.Timestamp(cur_date, tz=W.ET) + pd.Timedelta(days=1)
+            bnd = min(nxt_mid.tz_convert("UTC"), we)
+            edges.append((bnd - eff_now).total_seconds() / 3600.0)
+            date_seq.append(cur_date)
+            cur, cur_date = bnd, cur_date + dt.timedelta(days=1)
+
+        now_offset = (eff_now - ws).total_seconds() / 3600.0
+        n_h = int(np.ceil(T_remaining)) + 1
+        g_window = np.array([
+            168.0 * fit.intensity.shape[W.et_cell_of_offset(window_start, now_offset + k)]
+            for k in range(n_h)
+        ])
+        beta = fit.hawkes.beta
+        lookback_h = min(72.0, 8.0 / max(beta, 1e-3))
+        seed_evs = posts.loc[
+            (posts["created_at"] >= eff_now - pd.Timedelta(hours=lookback_h))
+            & (posts["created_at"] < eff_now), "created_at"
+        ]
+        Z0 = H.seed_decay_sum((eff_now - seed_evs).dt.total_seconds().values / 3600.0, beta)
+        n_obs_win = int(((posts["created_at"] >= ws) & (posts["created_at"] < eff_now)).sum())
+        elapsed_mass = float(
+            sum(fit.intensity.shape[W.et_cell_of_offset(window_start, k)]
+                for k in range(int(round(now_offset))))
+        )
+        levels = fit.intensity.sample_level_conditional(rng, n_sims, n_obs_win, elapsed_mass)
+        buckets = H.simulate_remaining_daily(
+            rng, g_window, T_remaining, levels, fit.hawkes.alpha, beta,
+            np.full(n_sims, Z0), np.array(edges),
+        )
+        sim_by_date = {d: buckets[:, i] for i, d in enumerate(date_seq)}
+
+    # --- assemble per day ---
+    out = []
+    for d in et_dates:
+        d_start = max((pd.Timestamp(d, tz=W.ET)).tz_convert("UTC"), ws)
+        d_end = min((pd.Timestamp(d, tz=W.ET) + pd.Timedelta(days=1)).tz_convert("UTC"), we)
+        actual = int(
+            ((posts["created_at"] >= d_start) & (posts["created_at"] < min(eff_now, d_end))).sum()
+        )
+        if d in sim_by_date:
+            tot = actual + sim_by_date[d]
+            status = "partiel" if d_start < eff_now < d_end else "futur"
+            out.append({
+                "date": d, "actual": actual, "status": status,
+                "est_median": float(np.median(tot)),
+                "est_p10": float(np.percentile(tot, 10)),
+                "est_p90": float(np.percentile(tot, 90)),
+            })
+        else:  # fully elapsed day -> known
+            out.append({
+                "date": d, "actual": actual, "status": "passé",
+                "est_median": float(actual), "est_p10": float(actual), "est_p90": float(actual),
+            })
+    return out
 
 
 def bracket_probabilities(

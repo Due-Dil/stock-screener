@@ -76,6 +76,7 @@ def run_backtest(
     checkpoints: tuple[float, ...] = (0.0, 0.35, 0.6, 0.85),
     n_sims: int = 4000,
     seed: int = 7,
+    level_prior_strength: float | None = 0.5,
 ) -> BacktestResult:
     brs = standard_brackets()
     hist_start = posts["created_at"].min().to_pydatetime()
@@ -96,7 +97,8 @@ def run_backtest(
         for frac in checkpoints:
             now = W.utc_ts(ws) + (W.utc_ts(we) - W.utc_ts(ws)) * frac
             fit = M.fit_model(posts, now.to_pydatetime())
-            fc = M.forecast(fit, ws, we, n_sims=n_sims, rng=rng)
+            fc = M.forecast(fit, ws, we, n_sims=n_sims, rng=rng,
+                            level_prior_strength=level_prior_strength)
             samp = fc.samples
             probs = np.array(
                 [

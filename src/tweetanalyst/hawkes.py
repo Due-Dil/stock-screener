@@ -146,6 +146,56 @@ def simulate_remaining(
     return out
 
 
+def simulate_remaining_daily(
+    rng: np.random.Generator,
+    g_window: np.ndarray,
+    T_remaining: float,
+    levels: np.ndarray,
+    alpha: float,
+    beta: float,
+    seed_decay_sum: np.ndarray,
+    day_edges_h: np.ndarray,   # ascending hour-offsets where the ET day rolls over; last == T_remaining
+    week_hours: float = 168.0,
+) -> np.ndarray:
+    """Like ``simulate_remaining`` but returns per-day counts: (n_sims, n_day_buckets).
+
+    Each accepted event is binned into the day bucket whose upper edge it falls under, so the
+    columns sum (per row) to the total remaining count. Used only for the per-day forecast chart.
+    """
+    n_sims = len(levels)
+    edges = np.asarray(day_edges_h, dtype=float)
+    n_buckets = len(edges)
+    g_window = np.asarray(g_window, dtype=float)
+    Gmax = float(g_window.max()) if g_window.size else 1.0
+    mu_scale = np.maximum(levels * (1.0 - alpha) / week_hours, 0.0)
+    seed = np.broadcast_to(seed_decay_sum, (n_sims,)).astype(float).copy()
+    out = np.zeros((n_sims, n_buckets), dtype=np.int64)
+    ab = alpha * beta
+    for s in range(n_sims):
+        ms = mu_scale[s]
+        bg_max = ms * Gmax
+        t = 0.0
+        Z = seed[s]
+        while True:
+            lam_bar = bg_max + ab * Z + 1e-12
+            w = rng.exponential(1.0 / lam_bar)
+            t_new = t + w
+            if t_new >= T_remaining:
+                break
+            Z *= np.exp(-beta * w)
+            hour_idx = int(t_new)
+            g_now = g_window[hour_idx] if hour_idx < g_window.size else g_window[-1]
+            lam_true = ms * g_now + ab * Z
+            if rng.random() <= lam_true / lam_bar:
+                bucket = int(np.searchsorted(edges, t_new, side="right"))
+                if bucket >= n_buckets:
+                    bucket = n_buckets - 1
+                out[s, bucket] += 1
+                Z += 1.0
+            t = t_new
+    return out
+
+
 def seed_decay_sum(now_minus_event_hours: np.ndarray, beta: float) -> float:
     """Z(now) = sum over recent real events of exp(-beta * age_in_hours)."""
     if len(now_minus_event_hours) == 0:
