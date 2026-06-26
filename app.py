@@ -1,477 +1,308 @@
+"""Streamlit app: probabilités par tranche pour les marchés Polymarket '# of tweets' d'Elon Musk.
+
+Lancer :  streamlit run app.py
+"""
 from __future__ import annotations
 
-import warnings
-warnings.filterwarnings("ignore")
+import datetime as dt
+import sys
+from pathlib import Path
 
-from flask import Flask, render_template_string, request, jsonify
-import yfinance as yf
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
 
-from universe import get_tickers, list_industries, filter_by_cap
-from screener import find_crossovers
-from indices import get_index_tickers, list_indices
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
-app = Flask(__name__)
+from tweetanalyst import backtest as BT  # noqa: E402
+from tweetanalyst import data as D  # noqa: E402
+from tweetanalyst import model as M  # noqa: E402
+from tweetanalyst import pipeline as P  # noqa: E402
+
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:  # graceful: live mode just disabled
+    _HAS_AUTOREFRESH = False
+
+DAYS = ["Lun", "Mar", "Mer", "Jeu", "Ven", "Sam", "Dim"]
+
+st.set_page_config(page_title="Elon Tweet Tracker", layout="wide")
+st.title("📊 Elon Musk — probabilités par tranche (Polymarket)")
+st.caption(
+    "Modèle: intensité saisonnière jour×heure (ET) + processus auto-excitant de Hawkes "
+    "(bursts) + Monte-Carlo de la fin de semaine. Données: xtracker.polymarket.com (source "
+    "de résolution) + Gamma API (tranches & prix live)."
+)
 
 
-@app.after_request
-def add_no_cache_headers(response):
-    """Prevent the browser from serving a stale cached version of the app."""
-    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
-    response.headers["Pragma"] = "no-cache"
-    response.headers["Expires"] = "0"
-    return response
+# --------------------------------------------------------------------------- #
+@st.cache_data(show_spinner=False, ttl=900)
+def list_active_markets(handle: str) -> list[tuple[str, str]]:
+    out = []
+    for tw in D.get_trackings(handle):
+        if tw.is_active and tw.market_link:
+            out.append((tw.title, D.slug_from_url(tw.market_link)))
+    return out
 
 
-INDUSTRIES = list_industries()
-INDICES = list_indices()
-
-# Human-readable exchange names → financedatabase code
-EXCHANGES = {
-    "NASDAQ": "NMS",
-    "NYSE": "NYQ",
-    "NYSE American": "ASE",
-    "OTC Markets": "PNK",
-    "Euronext Paris": "PAR",
-    "London Stock Exchange": "LSE",
-    "Toronto Stock Exchange": "TOR",
-}
-
-HTML = """<!DOCTYPE html>
-<html>
-<head>
-  <meta charset="utf-8">
-  <title>Stock Screener</title>
-  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: #0f0f1a; color: #eaeaea; font-family: -apple-system, BlinkMacSystemFont, sans-serif; display: flex; height: 100vh; overflow: hidden; }
-
-    /* ── Sidebar ── */
-    #sidebar {
-      width: 290px; min-width: 290px; background: #13132a; border-right: 1px solid #1e1e40;
-      padding: 24px 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px;
+@st.cache_data(show_spinner=True, ttl=600)
+def cached_run(slug: str, handle: str, now_iso: str | None, n_sims: int,
+               half_life: float, fit_days: float, gamma: float,
+               refresh_token: int = 0) -> dict:
+    # refresh_token busts the cache on each live tick (live mode); 0 = normal 10-min cache.
+    now = dt.datetime.fromisoformat(now_iso) if now_iso else None
+    run = P.run_forecast(slug, handle=handle, now=now, n_sims=n_sims, gamma=gamma)
+    conf = M.confidence_report(run.table, run.forecast.samples,
+                               run.forecast.summary()["hours_remaining"])
+    # repackage to a cacheable dict (avoid caching heavy objects with live handles)
+    return {
+        "confidence": conf,
+        "title": run.market.title,
+        "window_start": run.window_start,
+        "window_end": run.window_end,
+        "now": run.now,
+        "table": run.table,
+        "samples": run.forecast.samples,
+        "summary": run.forecast.summary(),
+        "heatmap": run.fit.intensity.heatmap(),
+        "alpha": run.fit.hawkes.alpha,
+        "beta": run.fit.hawkes.beta,
+        "burst_h": run.fit.hawkes.burst_timescale_h,
+        "mean_level": run.fit.intensity.mean_level,
+        "weekly_totals": run.fit.intensity.weekly_totals,
     }
-    #sidebar h2 { font-size: 1.1rem; color: #aac4ff; letter-spacing: 0.05em; margin-bottom: 2px; }
-
-    .field { display: flex; flex-direction: column; gap: 5px; }
-    .field label { font-size: 0.72rem; color: #888; letter-spacing: 0.06em; text-transform: uppercase; }
-    .field select, .field input {
-      background: #1a1a35; border: 1px solid #2a2a55; color: #eaeaea;
-      padding: 8px 10px; border-radius: 6px; font-size: 0.88rem; width: 100%;
-      appearance: none;
-    }
-    .field select:focus, .field input:focus { outline: none; border-color: #4f8ef7; }
-    .field .hint { font-size: 0.7rem; color: #556; margin-top: 2px; }
-
-    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-
-    .divider { border: none; border-top: 1px solid #1e1e40; margin: 4px 0; }
-
-    /* Universe count pill */
-    #universe-count {
-      display: flex; align-items: center; justify-content: space-between;
-      background: #1a1a35; border: 1px solid #2a2a55; border-radius: 8px;
-      padding: 9px 14px; font-size: 0.85rem;
-    }
-    #universe-count span { color: #888; }
-    #count-val { color: #50c878; font-weight: 700; font-size: 1rem; }
-    #count-spinner { display: none; }
-    #count-spinner.active { display: inline-block; }
-
-    button#run {
-      padding: 11px; background: #4f8ef7; color: #fff;
-      border: none; border-radius: 8px; font-size: 0.95rem; font-weight: 600;
-      cursor: pointer; transition: background 0.2s;
-    }
-    button#run:hover { background: #3a7de8; }
-    button#run:disabled { background: #2a2a55; color: #555; cursor: not-allowed; }
-    #run-status { font-size: 0.8rem; color: #888; text-align: center; min-height: 18px; }
-
-    /* ── Main ── */
-    #main { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-
-    /* ── Table ── */
-    #table-wrap { flex: 1; overflow-y: auto; padding: 24px; }
-    table { width: 100%; border-collapse: collapse; }
-    th {
-      background: #13132a; padding: 10px 16px; text-align: left;
-      font-size: 0.75rem; color: #aac4ff; letter-spacing: 0.06em;
-      text-transform: uppercase; position: sticky; top: 0; z-index: 1;
-    }
-    td { padding: 11px 16px; border-bottom: 1px solid #1a1a30; font-size: 0.88rem; }
-    tbody tr { cursor: pointer; transition: background 0.15s; }
-    tbody tr:hover td { background: #1a1a35; }
-    tbody tr.active td { background: #1e2a50; }
-    .badge-up {
-      display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.75rem; font-weight: 600;
-      background: rgba(80,200,120,0.15); color: #50c878; border: 1px solid rgba(80,200,120,0.3);
-    }
-    .empty-msg { text-align: center; color: #555; padding: 80px 0; font-size: 1rem; }
-
-    /* ── Chart panel ── */
-    #chart-panel {
-      height: 0; overflow: hidden; border-top: 1px solid #1e1e40;
-      transition: height 0.3s ease; background: #13132a;
-    }
-    #chart-panel.open { height: 360px; }
-    #chart-inner { padding: 12px 24px 16px; height: 100%; display: flex; flex-direction: column; }
-    #chart-title {
-      font-size: 0.92rem; color: #aac4ff; margin-bottom: 6px;
-      display: flex; align-items: center; justify-content: space-between; flex-shrink: 0;
-    }
-    #chart-name { color: #888; font-size: 0.8rem; margin-left: 8px; }
-    #close-chart { background: none; border: none; color: #888; font-size: 1.2rem; cursor: pointer; }
-    #close-chart:hover { color: #eaeaea; }
-    #plotly-chart { flex: 1; min-height: 0; }
-
-    /* ── Spinner ── */
-    .spinner {
-      display: inline-block; width: 12px; height: 12px;
-      border: 2px solid #2a2a55; border-top-color: #4f8ef7;
-      border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; margin-right: 5px;
-    }
-    @keyframes spin { to { transform: rotate(360deg); } }
-  </style>
-</head>
-<body>
-
-<div id="sidebar">
-  <h2>Filters</h2>
-
-  <div class="field">
-    <label>Index</label>
-    <select id="index_filter" onchange="scheduleCount()">
-      <option value="">—</option>
-      {% for i in indices %}<option value="{{ i }}">{{ i }}</option>{% endfor %}
-    </select>
-  </div>
-
-  <div class="field">
-    <label>Exchange</label>
-    <select id="exchange" onchange="scheduleCount()">
-      <option value="">All</option>
-      {% for label, code in exchanges.items() %}<option value="{{ code }}" {% if code == 'NMS' %}selected{% endif %}>{{ label }}</option>{% endfor %}
-    </select>
-  </div>
-
-  <div class="field">
-    <label>Industry Group</label>
-    <select id="industry" onchange="scheduleCount()">
-      <option value="">All</option>
-      {% for i in industries %}<option value="{{ i }}">{{ i }}</option>{% endfor %}
-    </select>
-  </div>
-
-  <div class="row2">
-    <div class="field">
-      <label>Min Market Cap</label>
-      <input type="number" id="min_cap" placeholder="e.g. 2" min="0" step="0.1" oninput="scheduleCount()">
-      <span class="hint">in $ billions</span>
-    </div>
-    <div class="field">
-      <label>Max Market Cap</label>
-      <input type="number" id="max_cap" placeholder="e.g. 200" min="0" step="0.1" oninput="scheduleCount()">
-      <span class="hint">in $ billions</span>
-    </div>
-  </div>
-
-  <hr class="divider">
-
-  <div class="row2">
-    <div class="field">
-      <label>MA Fast</label>
-      <input type="number" id="ma_fast" value="50" min="2" max="200">
-    </div>
-    <div class="field">
-      <label>MA Slow</label>
-      <input type="number" id="ma_slow" value="200" min="2" max="500">
-    </div>
-  </div>
-
-  <div class="field">
-    <label>Crossover within (days)</label>
-    <input type="number" id="crossover_within" value="20" min="1" max="90">
-  </div>
-
-  <hr class="divider">
-
-  <div id="universe-count">
-    <span>Universe size</span>
-    <span>
-      <span class="spinner" id="count-spinner"></span>
-      <span id="count-val">—</span>
-    </span>
-  </div>
-  <div id="cap-hint" style="display:none; font-size:0.72rem; color:#e0a030; line-height:1.4;">
-    ⚠︎ Trop d'entreprises pour le filtre de capitalisation exact. Sélectionne un indice ou un exchange/industry pour le réduire sous 800.
-  </div>
-
-  <button id="run" onclick="runScreener()">Run Screener</button>
-  <div id="run-status"></div>
-</div>
-
-<div id="main">
-  <div id="table-wrap">
-    <div class="empty-msg">Set your filters and click <strong>Run Screener</strong>.</div>
-  </div>
-  <div id="chart-panel">
-    <div id="chart-inner">
-      <div id="chart-title">
-        <div><strong id="chart-ticker-label"></strong><span id="chart-name"></span></div>
-        <button id="close-chart" onclick="closeChart()">✕</button>
-      </div>
-      <div id="plotly-chart"></div>
-    </div>
-  </div>
-</div>
-
-<script>
-let currentMaFast = 20, currentMaSlow = 50;
-let countTimer = null;
-
-function getFilters() {
-  return {
-    index_filter: document.getElementById('index_filter').value,
-    exchange: document.getElementById('exchange').value,
-    industry: document.getElementById('industry').value,
-    min_cap: parseFloat(document.getElementById('min_cap').value) || null,
-    max_cap: parseFloat(document.getElementById('max_cap').value) || null,
-    ma_fast: parseInt(document.getElementById('ma_fast').value) || 20,
-    ma_slow: parseInt(document.getElementById('ma_slow').value) || 50,
-    crossover_within: parseInt(document.getElementById('crossover_within').value) || 20,
-  };
-}
-
-function scheduleCount() {
-  clearTimeout(countTimer);
-  document.getElementById('count-spinner').classList.add('active');
-  document.getElementById('count-val').textContent = '—';
-  countTimer = setTimeout(fetchCount, 400);
-}
-
-async function fetchCount() {
-  const f = getFilters();
-  try {
-    const res = await fetch('/count', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ index_filter: f.index_filter, exchange: f.exchange, industry: f.industry, min_cap: f.min_cap, max_cap: f.max_cap }),
-    });
-    const data = await res.json();
-    document.getElementById('count-val').textContent = data.count;
-    const hint = document.getElementById('cap-hint');
-    hint.style.display = data.cap_skipped ? 'block' : 'none';
-  } catch(e) {
-    document.getElementById('count-val').textContent = '?';
-  }
-  document.getElementById('count-spinner').classList.remove('active');
-}
-
-async function runScreener() {
-  const btn = document.getElementById('run');
-  const status = document.getElementById('run-status');
-  btn.disabled = true;
-  status.innerHTML = '<span class="spinner"></span>Scanning…';
-  closeChart();
-
-  const params = getFilters();
-  currentMaFast = params.ma_fast;
-  currentMaSlow = params.ma_slow;
-
-  try {
-    const res = await fetch('/screen', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    });
-    const data = await res.json();
-    renderTable(data.results, params.ma_fast, params.ma_slow);
-    status.textContent = `${data.results.length} result(s) — ${data.tickers_scanned} tickers scanned`;
-  } catch(e) {
-    status.textContent = 'Error: ' + e.message;
-  }
-  btn.disabled = false;
-}
-
-function renderTable(results, maFast, maSlow) {
-  const wrap = document.getElementById('table-wrap');
-  if (!results.length) {
-    wrap.innerHTML = '<div class="empty-msg">No crossovers found with current filters.</div>';
-    return;
-  }
-  const rows = results.map(r => `
-    <tr onclick="loadChart('${r.ticker}', '${r.name || ''}')">
-      <td><strong>${r.ticker}</strong></td>
-      <td style="color:#aaa">${r.name || '—'}</td>
-      <td><span class="badge-up">▲ ${r.crossover_date}</span></td>
-      <td>${r.price.toFixed(2)}</td>
-      <td>${r['MA' + maFast].toFixed(2)}</td>
-      <td>${r['MA' + maSlow].toFixed(2)}</td>
-    </tr>`).join('');
-  wrap.innerHTML = `<table>
-    <thead><tr>
-      <th>Ticker</th><th>Name</th><th>Crossover</th><th>Price</th>
-      <th>MA${maFast}</th><th>MA${maSlow}</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`;
-}
-
-async function loadChart(ticker, name) {
-  document.querySelectorAll('tbody tr').forEach(r => r.classList.remove('active'));
-  const row = [...document.querySelectorAll('tbody tr')].find(r => r.querySelector('td strong')?.textContent === ticker);
-  if (row) row.classList.add('active');
-
-  const panel = document.getElementById('chart-panel');
-  panel.classList.add('open');
-  document.getElementById('chart-ticker-label').textContent = ticker;
-  document.getElementById('chart-name').textContent = name ? ' — ' + name : '';
-  document.getElementById('plotly-chart').innerHTML =
-    '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#555"><span class="spinner"></span> Loading…</div>';
-
-  const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}`);
-  const data = await res.json();
-  Plotly.newPlot('plotly-chart', data.traces, data.layout, { responsive: true, displayModeBar: false });
-}
-
-function closeChart() {
-  document.getElementById('chart-panel').classList.remove('open');
-  document.querySelectorAll('tbody tr').forEach(r => r.classList.remove('active'));
-}
-
-// Count on page load
-fetchCount();
-</script>
-</body>
-</html>
-"""
 
 
-@app.route("/")
-def index():
-    return render_template_string(HTML, exchanges=EXCHANGES, industries=INDUSTRIES, indices=INDICES)
+# --------------------------------------------------------------------------- #
+# Sidebar controls
+# --------------------------------------------------------------------------- #
+st.sidebar.header("Paramètres")
+handle = st.sidebar.text_input("Compte (handle)", value="elonmusk")
 
+try:
+    markets = list_active_markets(handle)
+except Exception as e:  # noqa: BLE001
+    markets = []
+    st.sidebar.warning(f"Marchés actifs indisponibles: {e}")
 
-# Above this universe size we skip the (slow) exact market-cap fetch
-MAX_CAP_FILTER_UNIVERSE = 800
-
-
-def _build_tickers(params: dict) -> tuple[list[str], bool]:
-    """Return (tickers, cap_skipped). cap_skipped is True when a cap filter was
-    requested but the universe was too large to fetch real market caps."""
-    tickers = get_tickers(
-        exchange=params.get("exchange") or None,
-        industry_group=params.get("industry") or None,
+market_labels = [m[0] for m in markets]
+mode = st.sidebar.radio("Marché", ["Marchés actifs", "URL / slug manuel"], index=0)
+if mode == "Marchés actifs" and markets:
+    pick = st.sidebar.selectbox("Choisir", market_labels)
+    slug = dict(zip(market_labels, [m[1] for m in markets]))[pick]
+else:
+    url = st.sidebar.text_input(
+        "URL Polymarket ou slug",
+        value="elon-musk-of-tweets-june-26-july-3",
     )
-    index_name = params.get("index_filter") or ""
-    if index_name:
-        index_set = set(get_index_tickers(index_name))
-        tickers = [t for t in tickers if t in index_set] if tickers else list(index_set)
+    slug = D.slug_from_url(url)
 
-    min_cap = params.get("min_cap")
-    max_cap = params.get("max_cap")
-    cap_requested = min_cap is not None or max_cap is not None
+n_sims = st.sidebar.select_slider("Simulations Monte-Carlo", [4000, 8000, 20000, 40000], value=20000)
+half_life = st.sidebar.slider("Demi-vie récence (jours)", 7, 60, 28)
+fit_days = st.sidebar.slider("Fenêtre fit Hawkes (jours)", 30, 180, 90)
+gamma = st.sidebar.slider(
+    "Recalibrage (sharpening γ)", 1.0, 3.0, float(P.CALIBRATED_GAMMA), 0.05,
+    help="γ>1 resserre la distribution pour corriger la sous-confiance mesurée au backtest. "
+         "1.0 = probas brutes du modèle. Valeur par défaut calibrée sur 16 semaines.",
+)
 
-    if cap_requested:
-        if len(tickers) > MAX_CAP_FILTER_UNIVERSE:
-            return tickers, True
-        tickers = filter_by_cap(
-            tickers,
-            min_cap_b=float(min_cap) if min_cap is not None else None,
-            max_cap_b=float(max_cap) if max_cap is not None else None,
+override = st.sidebar.checkbox("Forcer une date 'as of' (backtest manuel)")
+now_iso = None
+if override:
+    d = st.sidebar.date_input("Date", value=dt.date(2026, 6, 23))
+    t = st.sidebar.time_input("Heure (UTC)", value=dt.time(16, 0))
+    now_iso = dt.datetime.combine(d, t).replace(tzinfo=dt.timezone.utc).isoformat()
+
+# ---- Live mode: auto re-pull (incremental) + recompute on an interval ----
+st.sidebar.markdown("---")
+live = st.sidebar.checkbox(
+    "🔴 Mode live (auto-refresh)", value=False, disabled=(override or not _HAS_AUTOREFRESH),
+    help="Re-tire les nouveaux tweets (incrémental, ~5 min de latence XTracker) et recalcule "
+         "automatiquement. À activer surtout en fin de semaine près de la clôture.",
+)
+if override:
+    st.sidebar.caption("Mode live indisponible avec une date forcée.")
+elif not _HAS_AUTOREFRESH:
+    st.sidebar.caption("Installer `streamlit-autorefresh` pour activer le mode live.")
+
+refresh_token = 0
+if live:
+    interval = st.sidebar.select_slider("Intervalle live", [30, 60, 120, 300], value=60,
+                                        format_func=lambda x: f"{x}s")
+    tick = st_autorefresh(interval=interval * 1000, key="live_tick")
+    refresh_token = int(tick)  # changes each tick -> busts cached_run -> fresh pull + recompute
+
+if st.sidebar.button("🔄 Rafraîchir les données"):
+    cached_run.clear()
+    list_active_markets.clear()
+
+# --------------------------------------------------------------------------- #
+# Run
+# --------------------------------------------------------------------------- #
+try:
+    R = cached_run(slug, handle, now_iso, n_sims, half_life, fit_days, gamma, refresh_token)
+except Exception as e:  # noqa: BLE001
+    st.error(f"Erreur: {e}")
+    st.stop()
+
+if live:
+    st.caption(f"🔴 Live — dernière mise à jour {dt.datetime.now().strftime('%H:%M:%S')} "
+               f"(re-tirage incrémental toutes les {interval}s)")
+
+s = R["summary"]
+remaining_h = s["hours_remaining"]
+settled = remaining_h <= 0
+
+st.subheader(R["title"])
+c1, c2, c3, c4, c5 = st.columns(5)
+c1.metric("Tweets observés", s["n_obs"])
+c2.metric("Heures restantes", f"{remaining_h:.0f}" if not settled else "réglé")
+c3.metric("Total final (médiane)", f"{s['median']:.0f}")
+c4.metric("Intervalle 90%", f"{s['p5']:.0f}–{s['p95']:.0f}")
+c5.metric("Niveau hebdo moyen", f"{R['mean_level']:.0f}")
+
+# --------------------------------------------------------------------------- #
+# Bracket table with edge
+# --------------------------------------------------------------------------- #
+st.markdown("### Probabilités par tranche")
+# ---- Confidence panel (built on the distance-to-edge insight) ----
+conf = R["confidence"]
+saf = conf["safety"]
+if saf >= 1.5:
+    badge, color = "🟢 CONFIANT", "rgba(0,160,0,0.18)"
+elif conf["young_week"]:
+    badge, color = "⚪️ TROP TÔT", "rgba(150,150,150,0.18)"
+elif saf <= 0.7:
+    badge, color = "🟠 BORD DE TRANCHE", "rgba(230,150,0,0.20)"
+else:
+    badge, color = "🟡 INTERMÉDIAIRE", "rgba(220,200,0,0.15)"
+
+st.markdown(
+    f"<div style='background:{color};padding:10px 14px;border-radius:8px'>"
+    f"<b>Indice de confiance — {badge}</b> &nbsp;|&nbsp; "
+    f"Tranche la plus probable : <b>{conf['top_label']}</b> à <b>{conf['top_prob']:.0%}</b> "
+    f"&nbsp;|&nbsp; Total projeté ≈ <b>{conf['proj_total']:.0f}</b>, "
+    f"marge au bord de tranche : <b>{conf['margin']:.0f} tweets</b> "
+    f"(soit <b>{conf['safety']:.1f}×</b> l'incertitude restante)<br>"
+    f"<span style='font-size:0.9em'>→ {conf['regime']}</span></div>",
+    unsafe_allow_html=True,
+)
+st.caption(
+    "La confiance = proba sur la tranche leader. La *marge au bord* est le levier clé : un total "
+    "loin d'un bord de 20 = modèle sûr (peu d'edge) ; collé à un bord = un burst peut tout faire "
+    "basculer (incertitude = opportunité)."
+)
+
+df = pd.DataFrame(R["table"])
+df_disp = pd.DataFrame(
+    {
+        "Tranche": df["label"],
+        "Proba modèle": df["model_prob"],
+        "Prix OUI": df["yes_price"],
+        "Prix NON": df["no_price"],
+        "Action": df["best_side"],
+        "Edge du pari": df["best_edge"],
+    }
+)
+
+
+def _hl_action(row):
+    side = row["Action"]
+    e = row["Edge du pari"]
+    if side == "OUI" and pd.notna(e) and e > 0.03:
+        return ["background-color: rgba(0,180,0,0.22)"] * len(row)
+    if side == "NON" and pd.notna(e) and e > 0.03:
+        return ["background-color: rgba(80,140,230,0.22)"] * len(row)
+    return [""] * len(row)
+
+
+styled = (
+    df_disp.style.format(
+        {"Proba modèle": "{:.1%}", "Prix OUI": "{:.2f}", "Prix NON": "{:.2f}",
+         "Edge du pari": "{:+.1%}"},
+        na_rep="—",
+    )
+    .apply(_hl_action, axis=1)
+)
+st.dataframe(styled, use_container_width=True, hide_index=True, height=min(680, 38 * (len(df) + 1)))
+st.caption(
+    "**Action** = côté recommandé. 🟢 Vert = acheter **OUI** (tranche sous-cotée). "
+    "🔵 Bleu = acheter **NON** (tranche surcotée). *Edge du pari* = avantage estimé du côté "
+    "recommandé, après recalibrage γ. Seuls les paris à edge > 3 pts sont surlignés."
+)
+
+# --------------------------------------------------------------------------- #
+# Charts
+# --------------------------------------------------------------------------- #
+col_l, col_r = st.columns(2)
+
+with col_l:
+    st.markdown("#### Distribution simulée du total final")
+    samples = R["samples"]
+    fig = go.Figure()
+    fig.add_histogram(x=samples, nbinsx=60, marker_color="#4C9BE8", name="simulé")
+    fig.add_vline(x=s["n_obs"], line_dash="dot", line_color="gray",
+                  annotation_text=f"observés ({s['n_obs']})")
+    fig.add_vline(x=s["median"], line_color="#E8704C", annotation_text="médiane")
+    fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10),
+                      xaxis_title="total tweets sur la semaine", yaxis_title="fréquence")
+    st.plotly_chart(fig, use_container_width=True)
+
+with col_r:
+    st.markdown("#### Modèle vs marché par tranche")
+    fig2 = go.Figure()
+    fig2.add_bar(x=df["label"], y=df["model_prob"], name="Modèle", marker_color="#4C9BE8")
+    if df["market_price"].notna().any():
+        fig2.add_bar(x=df["label"], y=df["market_price"], name="Marché", marker_color="#E8B04C")
+    fig2.update_layout(height=360, barmode="group", margin=dict(l=10, r=10, t=10, b=10),
+                       xaxis_title="tranche", yaxis_title="probabilité",
+                       legend=dict(orientation="h", y=1.1))
+    st.plotly_chart(fig2, use_container_width=True)
+
+st.markdown("#### Rythme de tweets — intensité par jour × heure (heure ET, pondérée récence)")
+hm = R["heatmap"]  # (7, 24) tweets/hour
+figh = go.Figure(
+    go.Heatmap(z=hm, x=[f"{h:02d}h" for h in range(24)], y=DAYS,
+               colorscale="YlOrRd", colorbar=dict(title="tw/h"))
+)
+figh.update_layout(height=320, margin=dict(l=10, r=10, t=10, b=10))
+st.plotly_chart(figh, use_container_width=True)
+st.caption(
+    f"Hawkes: α={R['alpha']:.2f} (part de tweets déclenchés par 'burst'), "
+    f"échelle de burst ≈ {R['burst_h']*60:.0f} min. "
+    f"Totaux hebdo récents: {[int(x) for x in R['weekly_totals'][-8:]]}"
+)
+
+# --------------------------------------------------------------------------- #
+# Backtest (optional, heavier)
+# --------------------------------------------------------------------------- #
+st.markdown("---")
+with st.expander("🔬 Backtest de calibration (replay des semaines passées)"):
+    n_weeks = st.slider("Semaines à rejouer", 4, 24, 10)
+    bt_sims = st.select_slider("Sims/backtest", [2000, 4000, 8000], value=4000)
+    if st.button("Lancer le backtest"):
+        with st.spinner("Replay en cours…"):
+            posts = D.load_posts(handle, start=R["now"] - dt.timedelta(days=260), end=R["now"])
+            res = BT.run_backtest(posts, R["window_end"], n_weeks=n_weeks, n_sims=bt_sims)
+        g_opt, ll0, ll1 = BT.fit_sharpening(res.prob_matrix, res.true_idx)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Log-loss (↓ mieux)", f"{ll1:.3f}", delta=f"{ll1 - ll0:+.3f} vs brut")
+        m2.metric("Brier multiclasse (↓ mieux)", f"{res.brier:.3f}")
+        m3.metric("γ optimal (sharpening)", f"{g_opt:.2f}")
+        st.caption(
+            f"γ ajusté sur ces {n_weeks} semaines = **{g_opt:.2f}** (in-sample, donc légèrement "
+            f"optimiste). Reporte cette valeur dans le curseur 'Recalibrage' à gauche si tu veux "
+            f"l'appliquer aux prévisions."
         )
-    return tickers, False
-
-
-@app.route("/count", methods=["POST"])
-def count():
-    tickers, cap_skipped = _build_tickers(request.json)
-    return jsonify({"count": len(tickers), "cap_skipped": cap_skipped})
-
-
-@app.route("/screen", methods=["POST"])
-def screen():
-    params = request.json
-    tickers, cap_skipped = _build_tickers(params)
-    hits = find_crossovers(
-        tickers,
-        ma_fast=int(params.get("ma_fast", 20)),
-        ma_slow=int(params.get("ma_slow", 50)),
-        crossover_within=int(params.get("crossover_within", 20)),
-    )
-
-    enriched = []
-    for h in hits:
-        try:
-            name = yf.Ticker(h["ticker"]).fast_info.display_name or ""
-        except Exception:
-            name = ""
-        enriched.append({**h, "crossover_date": str(h["crossover_date"]), "name": name})
-
-    return jsonify({"results": enriched, "tickers_scanned": len(tickers), "cap_skipped": cap_skipped})
-
-
-@app.route("/chart/<ticker>")
-def chart(ticker: str):
-    ma_fast = int(request.args.get("ma_fast", 20))
-    ma_slow = int(request.args.get("ma_slow", 50))
-
-    # Fetch enough calendar days to cover ma_slow trading days (~1.5x multiplier) + 6 months of visible history
-    calendar_days = max(180, int(ma_slow * 1.5) + 180)
-    period = f"{calendar_days}d"
-    raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
-
-    # Always extract a clean 1-D Series regardless of MultiIndex structure
-    close_col = raw["Close"]
-    if isinstance(close_col, pd.DataFrame):
-        close_col = close_col.iloc[:, 0]
-    closes = close_col.dropna()
-
-    fast = closes.rolling(ma_fast).mean()
-    slow = closes.rolling(ma_slow).mean()
-
-    diff = (fast - slow).dropna()
-    cross_dates = [
-        str(diff.index[i].date())
-        for i in range(1, len(diff))
-        if diff.iloc[i - 1] < 0 and diff.iloc[i] > 0
-    ]
-
-    def series_to_xy(s: pd.Series) -> tuple[list, list]:
-        s = s.dropna()
-        return [str(d.date()) for d in s.index], s.tolist()
-
-    dates, prices = series_to_xy(closes)
-    fast_x, fast_y = series_to_xy(fast)
-    slow_x, slow_y = series_to_xy(slow)
-
-    traces = [
-        {"x": dates, "y": prices, "name": "Price", "type": "scatter", "mode": "lines",
-         "line": {"color": "#4f8ef7", "width": 1.5}},
-        {"x": fast_x, "y": fast_y, "name": f"MA{ma_fast}", "type": "scatter", "mode": "lines",
-         "line": {"color": "#f5a623", "width": 1.5, "dash": "dot"}},
-        {"x": slow_x, "y": slow_y, "name": f"MA{ma_slow}", "type": "scatter", "mode": "lines",
-         "line": {"color": "#e05c5c", "width": 1.5, "dash": "dash"}},
-    ]
-
-    shapes = [{"type": "line", "x0": d, "x1": d, "y0": 0, "y1": 1, "xref": "x", "yref": "paper",
-               "line": {"color": "rgba(80,200,120,0.7)", "width": 2}} for d in cross_dates]
-    annotations = [{"x": d, "y": 1, "xref": "x", "yref": "paper", "text": "Cross",
-                    "showarrow": False, "font": {"color": "rgba(80,200,120,1)", "size": 10},
-                    "yanchor": "bottom"} for d in cross_dates]
-
-    layout = {
-        "height": 300, "margin": {"l": 50, "r": 20, "t": 10, "b": 40},
-        "plot_bgcolor": "#1a1a2e", "paper_bgcolor": "#13132a", "font": {"color": "#eaeaea"},
-        "xaxis": {"gridcolor": "#2a2a4a"}, "yaxis": {"gridcolor": "#2a2a4a"},
-        "legend": {"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
-        "shapes": shapes, "annotations": annotations,
-    }
-
-    return jsonify({"traces": traces, "layout": layout})
-
-
-if __name__ == "__main__":
-    print("Starting Stock Screener at http://localhost:8080")
-    app.run(debug=False, port=8080)
+        rel = res.reliability
+        figr = go.Figure()
+        figr.add_scatter(x=[0, 1], y=[0, 1], mode="lines", line_dash="dash",
+                         line_color="gray", name="parfait")
+        figr.add_scatter(x=rel["mean_pred"], y=rel["hit_rate"], mode="markers+lines",
+                         marker_size=8, name="modèle")
+        figr.update_layout(height=380, xaxis_title="probabilité prédite",
+                           yaxis_title="fréquence réalisée", title="Courbe de fiabilité")
+        st.plotly_chart(figr, use_container_width=True)
+        st.dataframe(res.records, use_container_width=True, hide_index=True)
