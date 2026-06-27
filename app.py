@@ -3,6 +3,9 @@ from __future__ import annotations
 import warnings
 warnings.filterwarnings("ignore")
 
+import json
+import os
+
 from flask import Flask, render_template_string, request, jsonify
 import yfinance as yf
 import pandas as pd
@@ -12,6 +15,23 @@ from screener import find_crossovers
 from indices import get_index_tickers, list_indices
 
 app = Flask(__name__)
+
+# ── Watchlist persistence (simple JSON file next to this module) ──────
+WATCHLIST_FILE = os.path.join(os.path.dirname(__file__), "watchlist.json")
+
+
+def load_watchlist() -> list[dict]:
+    try:
+        with open(WATCHLIST_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_watchlist(items: list[dict]) -> None:
+    with open(WATCHLIST_FILE, "w") as f:
+        json.dump(items, f, indent=2)
 
 
 @app.after_request
@@ -26,15 +46,25 @@ def add_no_cache_headers(response):
 INDUSTRIES = list_industries()
 INDICES = list_indices()
 
-# Human-readable exchange names → financedatabase code
+# Human-readable exchange names → financedatabase code (verified to exist in the dataset)
 EXCHANGES = {
+    # — United States —
     "NASDAQ": "NMS",
     "NYSE": "NYQ",
     "NYSE American": "ASE",
     "OTC Markets": "PNK",
+    # — Europe —
     "Euronext Paris": "PAR",
+    "Euronext Amsterdam": "AMS",
+    "Euronext Lisbon": "LIS",
     "London Stock Exchange": "LSE",
-    "Toronto Stock Exchange": "TOR",
+    "Xetra (Germany)": "GER",
+    "Borsa Italiana (Milan)": "MIL",
+    "Bolsa de Madrid": "MCE",
+    "Nasdaq Stockholm": "STO",
+    "Nasdaq Helsinki": "HEL",
+    "Nasdaq Copenhagen": "CPH",
+    "Oslo Børs": "OSL",
 }
 
 HTML = """<!DOCTYPE html>
@@ -132,6 +162,27 @@ HTML = """<!DOCTYPE html>
       border-radius: 50%; animation: spin 0.7s linear infinite; vertical-align: middle; margin-right: 5px;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Watchlist (sidebar) ── */
+    #watchlist-header { font-size: 0.8rem; color: #f5c542; letter-spacing: 0.04em; margin-bottom: 8px; }
+    #watchlist-count { color: #666; font-weight: 400; }
+    #watchlist-items { display: flex; flex-direction: column; gap: 5px; }
+    .watchlist-empty { font-size: 0.75rem; color: #555; }
+    .wl-chip {
+      display: flex; align-items: center; justify-content: space-between;
+      background: #1a1a35; border: 1px solid #2a2a55; border-radius: 6px;
+      padding: 6px 8px 6px 10px; font-size: 0.82rem; cursor: pointer; transition: border-color 0.15s;
+    }
+    .wl-chip:hover { border-color: #4f8ef7; }
+    .wl-chip .wl-tk { font-weight: 600; }
+    .wl-chip .wl-nm { color: #888; font-size: 0.72rem; margin-left: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 130px; }
+    .wl-remove { background: none; border: none; color: #666; cursor: pointer; font-size: 0.95rem; padding: 0 2px; }
+    .wl-remove:hover { color: #e05c5c; }
+
+    /* ── Star toggle (table) ── */
+    .star-btn { background: none; border: none; cursor: pointer; font-size: 1rem; color: #444; padding: 0; line-height: 1; }
+    .star-btn.on { color: #f5c542; }
+    .star-btn:hover { color: #f5c542; }
   </style>
 </head>
 <body>
@@ -151,7 +202,7 @@ HTML = """<!DOCTYPE html>
     <label>Exchange</label>
     <select id="exchange" onchange="scheduleCount()">
       <option value="">All</option>
-      {% for label, code in exchanges.items() %}<option value="{{ code }}" {% if code == 'NMS' %}selected{% endif %}>{{ label }}</option>{% endfor %}
+      {% for label, code in exchanges.items() %}<option value="{{ code }}">{{ label }}</option>{% endfor %}
     </select>
   </div>
 
@@ -209,6 +260,13 @@ HTML = """<!DOCTYPE html>
 
   <button id="run" onclick="runScreener()">Run Screener</button>
   <div id="run-status"></div>
+
+  <hr class="divider">
+
+  <div id="watchlist-section">
+    <div id="watchlist-header">★ Watchlist <span id="watchlist-count"></span></div>
+    <div id="watchlist-items"><span class="watchlist-empty">Aucune action enregistrée</span></div>
+  </div>
 </div>
 
 <div id="main">
@@ -286,6 +344,13 @@ async function runScreener() {
       body: JSON.stringify(params),
     });
     const data = await res.json();
+    if (data.too_large) {
+      document.getElementById('table-wrap').innerHTML =
+        `<div class="empty-msg">Univers trop large (${data.tickers_scanned} titres > ${data.too_large}).<br>Affine avec un indice, un exchange ou une industrie.</div>`;
+      status.textContent = `${data.tickers_scanned} titres — trop pour scanner`;
+      btn.disabled = false;
+      return;
+    }
     renderTable(data.results, params.ma_fast, params.ma_slow);
     status.textContent = `${data.results.length} result(s) — ${data.tickers_scanned} tickers scanned`;
   } catch(e) {
@@ -294,28 +359,93 @@ async function runScreener() {
   btn.disabled = false;
 }
 
+let resultsByTicker = {};
+
 function renderTable(results, maFast, maSlow) {
   const wrap = document.getElementById('table-wrap');
   if (!results.length) {
     wrap.innerHTML = '<div class="empty-msg">No crossovers found with current filters.</div>';
     return;
   }
-  const rows = results.map(r => `
-    <tr onclick="loadChart('${r.ticker}', '${r.name || ''}')">
+  resultsByTicker = {};
+  results.forEach(r => { resultsByTicker[r.ticker] = r; });
+
+  const rows = results.map(r => {
+    const on = watchedSet.has(r.ticker) ? ' on' : '';
+    const star = watchedSet.has(r.ticker) ? '★' : '☆';
+    return `
+    <tr onclick="loadChart('${r.ticker}', resultsByTicker['${r.ticker}'].name)">
+      <td><button class="star-btn${on}" onclick="event.stopPropagation(); toggleWatch('${r.ticker}')">${star}</button></td>
       <td><strong>${r.ticker}</strong></td>
       <td style="color:#aaa">${r.name || '—'}</td>
       <td><span class="badge-up">▲ ${r.crossover_date}</span></td>
       <td>${r.price.toFixed(2)}</td>
       <td>${r['MA' + maFast].toFixed(2)}</td>
       <td>${r['MA' + maSlow].toFixed(2)}</td>
-    </tr>`).join('');
+    </tr>`;
+  }).join('');
   wrap.innerHTML = `<table>
     <thead><tr>
-      <th>Ticker</th><th>Name</th><th>Crossover</th><th>Price</th>
+      <th></th><th>Ticker</th><th>Name</th><th>Crossover</th><th>Price</th>
       <th>MA${maFast}</th><th>MA${maSlow}</th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table>`;
+}
+
+// ── Watchlist ──────────────────────────────────────────────────────
+let watchedSet = new Set();
+
+async function loadWatchlist() {
+  try {
+    const res = await fetch('/watchlist');
+    const items = await res.json();
+    watchedSet = new Set(items.map(it => it.ticker));
+    renderWatchlist(items);
+  } catch(e) { /* ignore */ }
+}
+
+function renderWatchlist(items) {
+  document.getElementById('watchlist-count').textContent = items.length ? `(${items.length})` : '';
+  const wrap = document.getElementById('watchlist-items');
+  if (!items.length) {
+    wrap.innerHTML = '<span class="watchlist-empty">Aucune action enregistrée</span>';
+    return;
+  }
+  wrap.innerHTML = items.map(it => `
+    <div class="wl-chip" onclick="loadChart('${it.ticker}', ${JSON.stringify(it.name || '')})">
+      <span><span class="wl-tk">${it.ticker}</span><span class="wl-nm">${it.name || ''}</span></span>
+      <button class="wl-remove" onclick="event.stopPropagation(); toggleWatch('${it.ticker}')" title="Retirer">✕</button>
+    </div>`).join('');
+}
+
+async function toggleWatch(ticker) {
+  const isOn = watchedSet.has(ticker);
+  let items;
+  if (isOn) {
+    items = await (await fetch('/watchlist/' + ticker, { method: 'DELETE' })).json();
+  } else {
+    const name = (resultsByTicker[ticker] && resultsByTicker[ticker].name) || '';
+    items = await (await fetch('/watchlist', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ticker, name }),
+    })).json();
+  }
+  watchedSet = new Set(items.map(it => it.ticker));
+  renderWatchlist(items);
+  // Update any star button currently shown in the table for this ticker
+  document.querySelectorAll('tbody tr').forEach(tr => {
+    const tk = tr.querySelector('td strong')?.textContent;
+    if (tk === ticker) {
+      const btn = tr.querySelector('.star-btn');
+      if (btn) {
+        const on = watchedSet.has(tk);
+        btn.classList.toggle('on', on);
+        btn.textContent = on ? '★' : '☆';
+      }
+    }
+  });
 }
 
 async function loadChart(ticker, name) {
@@ -345,8 +475,9 @@ function closeChart() {
   document.querySelectorAll('tbody tr').forEach(r => r.classList.remove('active'));
 }
 
-// Count on page load
+// On page load
 fetchCount();
+loadWatchlist();
 </script>
 </body>
 </html>
@@ -358,8 +489,37 @@ def index():
     return render_template_string(HTML, exchanges=EXCHANGES, industries=INDUSTRIES, indices=INDICES)
 
 
+@app.route("/watchlist", methods=["GET"])
+def watchlist_get():
+    return jsonify(load_watchlist())
+
+
+@app.route("/watchlist", methods=["POST"])
+def watchlist_add():
+    body = request.json or {}
+    ticker = (body.get("ticker") or "").strip().upper()
+    if not ticker:
+        return jsonify({"error": "ticker required"}), 400
+    items = load_watchlist()
+    if not any(it["ticker"] == ticker for it in items):
+        items.append({"ticker": ticker, "name": body.get("name") or ""})
+        save_watchlist(items)
+    return jsonify(items)
+
+
+@app.route("/watchlist/<ticker>", methods=["DELETE"])
+def watchlist_remove(ticker: str):
+    ticker = ticker.strip().upper()
+    items = [it for it in load_watchlist() if it["ticker"] != ticker]
+    save_watchlist(items)
+    return jsonify(items)
+
+
 # Above this universe size we skip the (slow) exact market-cap fetch
 MAX_CAP_FILTER_UNIVERSE = 800
+
+# Above this universe size we refuse to run the (very slow) crossover scan
+MAX_SCAN_UNIVERSE = 1500
 
 
 def _build_tickers(params: dict) -> tuple[list[str], bool]:
@@ -399,6 +559,15 @@ def count():
 def screen():
     params = request.json
     tickers, cap_skipped = _build_tickers(params)
+
+    if len(tickers) > MAX_SCAN_UNIVERSE:
+        return jsonify({
+            "results": [],
+            "tickers_scanned": len(tickers),
+            "cap_skipped": cap_skipped,
+            "too_large": MAX_SCAN_UNIVERSE,
+        })
+
     hits = find_crossovers(
         tickers,
         ma_fast=int(params.get("ma_fast", 20)),
