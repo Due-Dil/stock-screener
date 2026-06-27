@@ -14,7 +14,9 @@ _cap_cache: dict[str, float | None] = {}
 def _load() -> "pd.DataFrame":
     global _equities
     if _equities is None:
-        _equities = fd.Equities().select()
+        # exclude_exchanges=False keeps non-US listings (Paris, London, Xetra, ...)
+        # so European stocks are available, not just the US-deduplicated set.
+        _equities = fd.Equities().select(exclude_exchanges=False)
     return _equities
 
 

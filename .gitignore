@@ -1,6 +1,9 @@
 # Generated screener output
 results.html
 
+# Personal watchlist data
+watchlist.json
+
 # Python
 __pycache__/
 *.py[cod]
