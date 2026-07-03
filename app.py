@@ -507,18 +507,15 @@ async function loadChart(ticker, name) {
   document.getElementById('plotly-chart').innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#555"><span class="spinner"></span> Loading…</div>';
 
-  // Pass the current earnings filter so the chart marks the matching dates
-  const em = document.getElementById('earnings_mode').value;
-  const emo = parseInt(document.getElementById('earnings_months').value) || 3;
-  const earnQ = em ? `&earnings_mode=${em}&earnings_months=${emo}` : '';
-
-  const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}${earnQ}`);
+  const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}`);
   const data = await res.json();
   Plotly.newPlot('plotly-chart', data.traces, data.layout, { responsive: true, displayModeBar: false });
 
-  const earn = data.earnings || [];
+  const parts = [];
+  if (data.earnings_last) parts.push('dernier ' + data.earnings_last);
+  if (data.earnings_next) parts.push('prochain ' + data.earnings_next);
   document.getElementById('chart-earnings').textContent =
-    em ? (earn.length ? '◦ Earnings: ' + earn.join(', ') : '◦ Aucun earnings dans la fenêtre') : '';
+    parts.length ? '◦ Earnings : ' + parts.join(' | ') : '';
 }
 
 function closeChart() {
@@ -667,8 +664,6 @@ def screen():
 def chart(ticker: str):
     ma_fast = int(request.args.get("ma_fast", 20))
     ma_slow = int(request.args.get("ma_slow", 50))
-    earn_mode = request.args.get("earnings_mode") or ""
-    earn_months = float(request.args.get("earnings_months") or 3)
 
     # Fetch enough calendar days to cover ma_slow trading days (~1.5x multiplier) + 6 months of visible history
     calendar_days = max(180, int(ma_slow * 1.5) + 180)
@@ -715,23 +710,23 @@ def chart(ticker: str):
                     "showarrow": False, "font": {"color": "rgba(80,200,120,1)", "size": 10},
                     "yanchor": "bottom"} for d in cross_dates]
 
-    # Earnings markers (violet) — only when the earnings filter is active,
-    # showing the dates matching the selected mode/window.
-    earnings_dates = _earnings_match_dates(ticker, earn_mode, earn_months) if earn_mode else []
-    for d in earnings_dates:
+    # Earnings markers (violet) — always mark the last past and the next
+    # upcoming earnings, regardless of any filter.
+    last_e, next_e = _earnings_last_next(ticker)
+    earn_markers = [(last_e, "Dernier E"), (next_e, "Prochain E")]
+    for d, label in earn_markers:
+        if not d:
+            continue
         shapes.append({"type": "line", "x0": d, "x1": d, "y0": 0, "y1": 1, "xref": "x", "yref": "paper",
                        "line": {"color": "rgba(168,120,255,0.8)", "width": 2, "dash": "dot"}})
-        annotations.append({"x": d, "y": 0, "xref": "x", "yref": "paper", "text": "E",
+        annotations.append({"x": d, "y": 0, "xref": "x", "yref": "paper", "text": label,
                             "showarrow": False, "font": {"color": "rgba(168,120,255,1)", "size": 10},
                             "yanchor": "bottom"})
 
-    # If an upcoming earnings sits beyond the last price point, extend the x-axis to keep it visible
+    # If the next earnings sits beyond the last price point, extend the x-axis to keep it visible
     xaxis = {"gridcolor": "#2a2a4a"}
-    if earnings_dates:
-        last_date = dates[-1] if dates else None
-        max_earn = max(earnings_dates)
-        if last_date and max_earn > last_date:
-            xaxis["range"] = [dates[0], max_earn]
+    if next_e and dates and next_e > dates[-1]:
+        xaxis["range"] = [dates[0], next_e]
 
     layout = {
         "height": 300, "margin": {"l": 50, "r": 20, "t": 10, "b": 40},
@@ -741,7 +736,8 @@ def chart(ticker: str):
         "shapes": shapes, "annotations": annotations,
     }
 
-    return jsonify({"traces": traces, "layout": layout, "earnings": earnings_dates})
+    return jsonify({"traces": traces, "layout": layout,
+                    "earnings_last": last_e, "earnings_next": next_e})
 
 
 def _earnings_match_dates(ticker: str, mode: str, months: float) -> list[str]:
@@ -764,6 +760,22 @@ def _earnings_match_dates(ticker: str, mode: str, months: float) -> list[str]:
         return sorted({d.date().isoformat() for d in matches})
     except Exception:
         return []
+
+
+def _earnings_last_next(ticker: str) -> tuple[str | None, str | None]:
+    """Return (last past earnings, next upcoming earnings) as YYYY-MM-DD strings."""
+    try:
+        ed = yf.Ticker(ticker).get_earnings_dates(limit=24)
+        if ed is None or ed.empty:
+            return None, None
+        today = pd.Timestamp.now(tz=ed.index.tz)
+        past = [d for d in ed.index if d <= today]
+        future = [d for d in ed.index if d > today]
+        last = max(past).date().isoformat() if past else None
+        nxt = min(future).date().isoformat() if future else None
+        return last, nxt
+    except Exception:
+        return None, None
 
 
 if __name__ == "__main__":
