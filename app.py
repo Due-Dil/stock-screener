@@ -245,6 +245,33 @@ HTML = """<!DOCTYPE html>
     <input type="number" id="crossover_within" value="20" min="1" max="90">
   </div>
 
+  <div class="row2">
+    <div class="field">
+      <label>Earnings</label>
+      <select id="earnings_mode">
+        <option value="">Ignorer</option>
+        <option value="past">Passés (X derniers mois)</option>
+        <option value="future">À venir (X prochains mois)</option>
+        <option value="both">Passés OU à venir (± X mois)</option>
+      </select>
+    </div>
+    <div class="field">
+      <label>Fenêtre (mois)</label>
+      <input type="number" id="earnings_months" value="3" min="1" max="24" step="1">
+    </div>
+  </div>
+
+  <div class="row2">
+    <div class="field">
+      <label>Surge min (%)</label>
+      <input type="number" id="surge_min" placeholder="ex: 20" min="0" step="1">
+    </div>
+    <div class="field">
+      <label>Surge fenêtre (mois)</label>
+      <input type="number" id="surge_window_months" value="3" min="1" max="12" step="1">
+    </div>
+  </div>
+
   <hr class="divider">
 
   <div id="universe-count">
@@ -298,6 +325,10 @@ function getFilters() {
     ma_fast: parseInt(document.getElementById('ma_fast').value) || 20,
     ma_slow: parseInt(document.getElementById('ma_slow').value) || 50,
     crossover_within: parseInt(document.getElementById('crossover_within').value) || 20,
+    earnings_mode: document.getElementById('earnings_mode').value,
+    earnings_months: parseInt(document.getElementById('earnings_months').value) || 3,
+    surge_min: parseFloat(document.getElementById('surge_min').value) || null,
+    surge_window_months: parseInt(document.getElementById('surge_window_months').value) || 3,
   };
 }
 
@@ -370,15 +401,24 @@ function renderTable(results, maFast, maSlow) {
   resultsByTicker = {};
   results.forEach(r => { resultsByTicker[r.ticker] = r; });
 
+  // Earnings column only shown when the earnings filter was active
+  const showEarnings = results.some(r => (r.earnings || []).length);
+
   const rows = results.map(r => {
     const on = watchedSet.has(r.ticker) ? ' on' : '';
     const star = watchedSet.has(r.ticker) ? '★' : '☆';
+    const earnCell = showEarnings
+      ? `<td style="color:#a878ff">${(r.earnings || []).join(', ') || '—'}</td>` : '';
+    const surge = r.surge != null ? r.surge : 0;
+    const surgeColor = surge >= 20 ? '#50c878' : (surge >= 10 ? '#f5c542' : '#888');
     return `
     <tr onclick="loadChart('${r.ticker}', resultsByTicker['${r.ticker}'].name)">
       <td><button class="star-btn${on}" onclick="event.stopPropagation(); toggleWatch('${r.ticker}')">${star}</button></td>
       <td><strong>${r.ticker}</strong></td>
       <td style="color:#aaa">${r.name || '—'}</td>
       <td><span class="badge-up">▲ ${r.crossover_date}</span></td>
+      ${earnCell}
+      <td style="color:${surgeColor}; font-weight:600">+${surge.toFixed(1)}%</td>
       <td>${r.price.toFixed(2)}</td>
       <td>${r['MA' + maFast].toFixed(2)}</td>
       <td>${r['MA' + maSlow].toFixed(2)}</td>
@@ -386,7 +426,8 @@ function renderTable(results, maFast, maSlow) {
   }).join('');
   wrap.innerHTML = `<table>
     <thead><tr>
-      <th></th><th>Ticker</th><th>Name</th><th>Crossover</th><th>Price</th>
+      <th></th><th>Ticker</th><th>Name</th><th>Crossover</th>
+      ${showEarnings ? '<th>Earnings</th>' : ''}<th>Surge</th><th>Price</th>
       <th>MA${maFast}</th><th>MA${maSlow}</th>
     </tr></thead>
     <tbody>${rows}</tbody>
@@ -405,15 +446,20 @@ async function loadWatchlist() {
   } catch(e) { /* ignore */ }
 }
 
+let watchlistByTicker = {};
+
 function renderWatchlist(items) {
   document.getElementById('watchlist-count').textContent = items.length ? `(${items.length})` : '';
+  watchlistByTicker = {};
+  items.forEach(it => { watchlistByTicker[it.ticker] = it.name || ''; });
+
   const wrap = document.getElementById('watchlist-items');
   if (!items.length) {
     wrap.innerHTML = '<span class="watchlist-empty">Aucune action enregistrée</span>';
     return;
   }
   wrap.innerHTML = items.map(it => `
-    <div class="wl-chip" onclick="loadChart('${it.ticker}', ${JSON.stringify(it.name || '')})">
+    <div class="wl-chip" onclick="loadChart('${it.ticker}', watchlistByTicker['${it.ticker}'])">
       <span><span class="wl-tk">${it.ticker}</span><span class="wl-nm">${it.name || ''}</span></span>
       <button class="wl-remove" onclick="event.stopPropagation(); toggleWatch('${it.ticker}')" title="Retirer">✕</button>
     </div>`).join('');
@@ -461,13 +507,18 @@ async function loadChart(ticker, name) {
   document.getElementById('plotly-chart').innerHTML =
     '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#555"><span class="spinner"></span> Loading…</div>';
 
-  const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}`);
+  // Pass the current earnings filter so the chart marks the matching dates
+  const em = document.getElementById('earnings_mode').value;
+  const emo = parseInt(document.getElementById('earnings_months').value) || 3;
+  const earnQ = em ? `&earnings_mode=${em}&earnings_months=${emo}` : '';
+
+  const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}${earnQ}`);
   const data = await res.json();
   Plotly.newPlot('plotly-chart', data.traces, data.layout, { responsive: true, displayModeBar: false });
 
   const earn = data.earnings || [];
   document.getElementById('chart-earnings').textContent =
-    earn.length ? '◦ Earnings (±30j): ' + earn.join(', ') : '◦ Aucun earnings dans ±30j';
+    em ? (earn.length ? '◦ Earnings: ' + earn.join(', ') : '◦ Aucun earnings dans la fenêtre') : '';
 }
 
 function closeChart() {
@@ -568,12 +619,33 @@ def screen():
             "too_large": MAX_SCAN_UNIVERSE,
         })
 
+    surge_months = float(params.get("surge_window_months") or 3)
     hits = find_crossovers(
         tickers,
         ma_fast=int(params.get("ma_fast", 20)),
         ma_slow=int(params.get("ma_slow", 50)),
         crossover_within=int(params.get("crossover_within", 20)),
+        surge_window_months=surge_months,
     )
+
+    # Optional min-surge filter (largest run-up % around the crossover)
+    surge_min = params.get("surge_min")
+    if surge_min:
+        thr = float(surge_min)
+        hits = [h for h in hits if h.get("surge", 0) >= thr]
+
+    # Optional earnings-timing filter, applied to the (few) crossover hits
+    earn_mode = params.get("earnings_mode") or ""
+    earn_by_ticker = {}
+    if earn_mode:
+        earn_months = float(params.get("earnings_months") or 3)
+        kept = []
+        for h in hits:
+            dates = _earnings_match_dates(h["ticker"], earn_mode, earn_months)
+            if dates:
+                earn_by_ticker[h["ticker"]] = dates
+                kept.append(h)
+        hits = kept
 
     enriched = []
     for h in hits:
@@ -581,7 +653,12 @@ def screen():
             name = yf.Ticker(h["ticker"]).fast_info.display_name or ""
         except Exception:
             name = ""
-        enriched.append({**h, "crossover_date": str(h["crossover_date"]), "name": name})
+        enriched.append({
+            **h,
+            "crossover_date": str(h["crossover_date"]),
+            "name": name,
+            "earnings": earn_by_ticker.get(h["ticker"], []),
+        })
 
     return jsonify({"results": enriched, "tickers_scanned": len(tickers), "cap_skipped": cap_skipped})
 
@@ -590,6 +667,8 @@ def screen():
 def chart(ticker: str):
     ma_fast = int(request.args.get("ma_fast", 20))
     ma_slow = int(request.args.get("ma_slow", 50))
+    earn_mode = request.args.get("earnings_mode") or ""
+    earn_months = float(request.args.get("earnings_months") or 3)
 
     # Fetch enough calendar days to cover ma_slow trading days (~1.5x multiplier) + 6 months of visible history
     calendar_days = max(180, int(ma_slow * 1.5) + 180)
@@ -636,8 +715,9 @@ def chart(ticker: str):
                     "showarrow": False, "font": {"color": "rgba(80,200,120,1)", "size": 10},
                     "yanchor": "bottom"} for d in cross_dates]
 
-    # Earnings markers (violet) within ±30 days of today
-    earnings_dates = _get_earnings_window(ticker, days=30)
+    # Earnings markers (violet) — only when the earnings filter is active,
+    # showing the dates matching the selected mode/window.
+    earnings_dates = _earnings_match_dates(ticker, earn_mode, earn_months) if earn_mode else []
     for d in earnings_dates:
         shapes.append({"type": "line", "x0": d, "x1": d, "y0": 0, "y1": 1, "xref": "x", "yref": "paper",
                        "line": {"color": "rgba(168,120,255,0.8)", "width": 2, "dash": "dot"}})
@@ -664,17 +744,24 @@ def chart(ticker: str):
     return jsonify({"traces": traces, "layout": layout, "earnings": earnings_dates})
 
 
-def _get_earnings_window(ticker: str, days: int = 30) -> list[str]:
-    """Return earnings dates (as YYYY-MM-DD strings) within +/- `days` of today."""
+def _earnings_match_dates(ticker: str, mode: str, months: float) -> list[str]:
+    """Return the earnings dates (YYYY-MM-DD) that fall in the requested window.
+    mode: 'past' (last N months) | 'future' (next N months) | 'both' (past OR future).
+    Empty list => no matching earnings (ticker is filtered out)."""
     try:
         ed = yf.Ticker(ticker).get_earnings_dates(limit=24)
         if ed is None or ed.empty:
             return []
         today = pd.Timestamp.now(tz=ed.index.tz)
-        lo = today - pd.Timedelta(days=days)
-        hi = today + pd.Timedelta(days=days)
-        in_window = [ts for ts in ed.index if lo <= ts <= hi]
-        return sorted({ts.date().isoformat() for ts in in_window})
+        delta = pd.Timedelta(days=int(months * 30.44))
+        matches = []
+        for d in ed.index:
+            in_past = today - delta <= d <= today
+            in_future = today <= d <= today + delta
+            if (mode == "past" and in_past) or (mode == "future" and in_future) \
+                    or (mode == "both" and (in_past or in_future)):
+                matches.append(d)
+        return sorted({d.date().isoformat() for d in matches})
     except Exception:
         return []
 
