@@ -6,9 +6,16 @@ import financedatabase as fd
 import yfinance as yf
 
 _equities = None
+_cap_category_map = None
 
 # Cache real market caps (in USD) across requests: {ticker: cap or None}
 _cap_cache: dict[str, float | None] = {}
+
+# financedatabase market-cap categories and their $B bounds
+_CAP_BOUNDS = [
+    ("Nano Cap", 0, 0.05), ("Micro Cap", 0.05, 0.3), ("Small Cap", 0.3, 2),
+    ("Mid Cap", 2, 10), ("Large Cap", 10, 200), ("Mega Cap", 200, float("inf")),
+]
 
 
 def _load() -> "pd.DataFrame":
@@ -56,6 +63,28 @@ def get_market_caps(tickers: list[str], max_workers: int = 20) -> dict[str, floa
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             list(ex.map(_fetch_cap, to_fetch))
     return {t: _cap_cache.get(t) for t in tickers}
+
+
+def _cap_category(ticker: str) -> str | None:
+    """financedatabase market-cap category for a ticker (handles duplicate index)."""
+    global _cap_category_map
+    if _cap_category_map is None:
+        _cap_category_map = _load()["market_cap"].groupby(level=0).first().to_dict()
+    return _cap_category_map.get(ticker)
+
+
+def cap_candidates(tickers: list[str], min_cap_b: float | None, max_cap_b: float | None) -> list[str]:
+    """Cheaply narrow tickers to those whose cap CATEGORY overlaps the requested
+    $B range, using financedatabase (no network). Unknown categories are kept."""
+    lo = min_cap_b if min_cap_b is not None else 0.0
+    hi = max_cap_b if max_cap_b is not None else float("inf")
+    cats = {name for name, clo, chi in _CAP_BOUNDS if clo < hi and chi > lo}
+    out = []
+    for t in tickers:
+        c = _cap_category(t)
+        if c is None or c in cats:   # keep unknowns so we don't wrongly drop them
+            out.append(t)
+    return out
 
 
 def filter_by_cap(

@@ -10,7 +10,7 @@ from flask import Flask, render_template_string, request, jsonify
 import yfinance as yf
 import pandas as pd
 
-from universe import get_tickers, list_industries, filter_by_cap
+from universe import get_tickers, list_industries, filter_by_cap, cap_candidates
 from screener import find_crossovers
 from indices import get_index_tickers, list_indices
 
@@ -587,13 +587,13 @@ def _build_tickers(params: dict) -> tuple[list[str], bool]:
     cap_requested = min_cap is not None or max_cap is not None
 
     if cap_requested:
-        if len(tickers) > MAX_CAP_FILTER_UNIVERSE:
+        min_b = float(min_cap) if min_cap is not None else None
+        max_b = float(max_cap) if max_cap is not None else None
+        # Cheap category pre-filter first (no network), then guard, then exact fetch
+        candidates = cap_candidates(tickers, min_b, max_b)
+        if len(candidates) > MAX_CAP_FILTER_UNIVERSE:
             return tickers, True
-        tickers = filter_by_cap(
-            tickers,
-            min_cap_b=float(min_cap) if min_cap is not None else None,
-            max_cap_b=float(max_cap) if max_cap is not None else None,
-        )
+        tickers = filter_by_cap(candidates, min_cap_b=min_b, max_cap_b=max_b)
     return tickers, False
 
 
