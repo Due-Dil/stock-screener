@@ -188,6 +188,18 @@ HTML = """<!DOCTYPE html>
 <body>
 
 <div id="sidebar">
+  <div class="field">
+    <label>Rechercher un ticker</label>
+    <div style="display:flex; gap:6px;">
+      <input type="text" id="search_ticker" placeholder="ex: AAPL, MC.PA"
+             onkeydown="if(event.key==='Enter'){searchTicker();}" style="text-transform:uppercase;">
+      <button onclick="searchTicker()" title="Voir le graphique"
+              style="background:#4f8ef7;border:none;color:#fff;border-radius:6px;padding:0 12px;cursor:pointer;font-size:1rem;">→</button>
+    </div>
+  </div>
+
+  <hr class="divider">
+
   <h2>Filters</h2>
 
   <div class="field">
@@ -494,6 +506,11 @@ async function toggleWatch(ticker) {
   });
 }
 
+function searchTicker() {
+  const t = document.getElementById('search_ticker').value.trim().toUpperCase();
+  if (t) loadChart(t, '');
+}
+
 async function loadChart(ticker, name) {
   document.querySelectorAll('tbody tr').forEach(r => r.classList.remove('active'));
   const row = [...document.querySelectorAll('tbody tr')].find(r => r.querySelector('td strong')?.textContent === ticker);
@@ -509,6 +526,11 @@ async function loadChart(ticker, name) {
 
   const res = await fetch(`/chart/${ticker}?ma_fast=${currentMaFast}&ma_slow=${currentMaSlow}`);
   const data = await res.json();
+  if (data.error) {
+    document.getElementById('plotly-chart').innerHTML =
+      `<div style="display:flex;align-items:center;justify-content:center;height:100%;color:#e05c5c">${data.error}</div>`;
+    return;
+  }
   Plotly.newPlot('plotly-chart', data.traces, data.layout, { responsive: true, displayModeBar: false });
 
   const parts = [];
@@ -668,13 +690,17 @@ def chart(ticker: str):
     # Fetch enough calendar days to cover ma_slow trading days (~1.5x multiplier) + 6 months of visible history
     calendar_days = max(180, int(ma_slow * 1.5) + 180)
     period = f"{calendar_days}d"
-    raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    try:
+        raw = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+        close_col = raw["Close"]
+        if isinstance(close_col, pd.DataFrame):
+            close_col = close_col.iloc[:, 0]
+        closes = close_col.dropna()
+    except Exception:
+        closes = pd.Series(dtype=float)
 
-    # Always extract a clean 1-D Series regardless of MultiIndex structure
-    close_col = raw["Close"]
-    if isinstance(close_col, pd.DataFrame):
-        close_col = close_col.iloc[:, 0]
-    closes = close_col.dropna()
+    if closes.empty:
+        return jsonify({"error": f"Aucune donnée pour '{ticker}'"}), 404
 
     fast = closes.rolling(ma_fast).mean()
     slow = closes.rolling(ma_slow).mean()
