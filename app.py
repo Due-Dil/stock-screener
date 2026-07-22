@@ -34,6 +34,24 @@ def save_watchlist(items: list[dict]) -> None:
         json.dump(items, f, indent=2)
 
 
+# ── Saved filter/parameter settings ──────────────────────────────────
+SETTINGS_FILE = os.path.join(os.path.dirname(__file__), "user_settings.json")
+
+
+def load_settings() -> dict:
+    try:
+        with open(SETTINGS_FILE) as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_settings(data: dict) -> None:
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+
 @app.after_request
 def add_no_cache_headers(response):
     """Prevent the browser from serving a stale cached version of the app."""
@@ -300,6 +318,12 @@ HTML = """<!DOCTYPE html>
   <button id="run" onclick="runScreener()">Run Screener</button>
   <div id="run-status"></div>
 
+  <button id="save-settings" onclick="saveSettings()"
+          style="margin-top:8px; padding:8px; background:#1a1a35; color:#aac4ff; border:1px solid #2a2a55; border-radius:8px; font-size:0.85rem; cursor:pointer;">
+    💾 Enregistrer mes paramètres
+  </button>
+  <div id="save-status" style="font-size:0.75rem; color:#666; text-align:center; min-height:14px;"></div>
+
   <hr class="divider">
 
   <div id="watchlist-section">
@@ -512,6 +536,10 @@ function searchTicker() {
 }
 
 async function loadChart(ticker, name) {
+  // Always reflect the current MA inputs (works for search too, not just after a screen)
+  currentMaFast = parseInt(document.getElementById('ma_fast').value) || 20;
+  currentMaSlow = parseInt(document.getElementById('ma_slow').value) || 50;
+
   document.querySelectorAll('tbody tr').forEach(r => r.classList.remove('active'));
   const row = [...document.querySelectorAll('tbody tr')].find(r => r.querySelector('td strong')?.textContent === ticker);
   if (row) row.classList.add('active');
@@ -545,8 +573,39 @@ function closeChart() {
   document.querySelectorAll('tbody tr').forEach(r => r.classList.remove('active'));
 }
 
+// ── Saved settings ─────────────────────────────────────────────────
+const SETTING_IDS = ['index_filter','exchange','industry','min_cap','max_cap',
+  'ma_fast','ma_slow','crossover_within','earnings_mode','earnings_months',
+  'surge_min','surge_window_months'];
+
+async function saveSettings() {
+  const s = {};
+  SETTING_IDS.forEach(id => { s[id] = document.getElementById(id).value; });
+  const status = document.getElementById('save-status');
+  try {
+    await fetch('/settings', { method: 'POST', headers: {'Content-Type':'application/json'},
+                               body: JSON.stringify(s) });
+    status.textContent = '✓ Paramètres enregistrés';
+    setTimeout(() => { status.textContent = ''; }, 2500);
+  } catch(e) { status.textContent = 'Erreur'; }
+}
+
+function applySettings(s) {
+  SETTING_IDS.forEach(id => {
+    if (s[id] !== undefined && s[id] !== null) document.getElementById(id).value = s[id];
+  });
+}
+
+async function initSettings() {
+  try {
+    const s = await (await fetch('/settings')).json();
+    if (s && Object.keys(s).length) applySettings(s);
+  } catch(e) { /* ignore */ }
+  fetchCount();
+}
+
 // On page load
-fetchCount();
+initSettings();
 loadWatchlist();
 </script>
 </body>
@@ -583,6 +642,17 @@ def watchlist_remove(ticker: str):
     items = [it for it in load_watchlist() if it["ticker"] != ticker]
     save_watchlist(items)
     return jsonify(items)
+
+
+@app.route("/settings", methods=["GET"])
+def settings_get():
+    return jsonify(load_settings())
+
+
+@app.route("/settings", methods=["POST"])
+def settings_set():
+    save_settings(request.json or {})
+    return jsonify({"ok": True})
 
 
 # Above this universe size we skip the (slow) exact market-cap fetch
