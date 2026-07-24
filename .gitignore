@@ -4,6 +4,12 @@ results.html
 # Personal watchlist data
 watchlist.json
 
+# Saved filter settings
+user_settings.json
+
+# Backtest price-history cache (large binary, re-downloadable)
+history_cache.pkl
+
 # Python
 __pycache__/
 *.py[cod]

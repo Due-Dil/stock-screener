@@ -17,6 +17,7 @@ INDICES = {
     "Dow Jones":   ("https://en.wikipedia.org/wiki/Dow_Jones_Industrial_Average", ["Symbol", "Ticker"], "us"),
     "S&P 400":     ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", ["Symbol", "Ticker"], "us"),
     "S&P 600":     ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", ["Symbol", "Ticker"], "us"),
+    "Russell 1000": ("https://en.wikipedia.org/wiki/Russell_1000_Index", ["Symbol", "Ticker"], "us"),
     # — Europe —
     "CAC 40":      ("https://en.wikipedia.org/wiki/CAC_40", ["Ticker"], "verbatim"),
     "DAX":         ("https://en.wikipedia.org/wiki/DAX", ["Ticker"], "verbatim"),
